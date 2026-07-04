@@ -82,13 +82,14 @@ async def _browser_api_call(page, method: str, url: str, headers: dict) -> dict:
 				credentials: 'include',
 			}).then(async (resp) => {
 				const text = await resp.text();
-				return {ok: resp.ok, status: resp.status, body: text};
+				return {ok: resp.ok, status: resp.status, url: resp.url, body: text};
 			}).catch((e) => {
-				return {ok: false, status: 0, body: '', error: e.message};
+				return {ok: false, status: 0, body: '', url: '', error: e.message};
 			});
 		}""",
 		payload,
 	)
+	print(f'[DEBUG] browser API call: method={method}, url={url}, result_status={result.get("status")}, result_url={result.get("url")}, body_len={len(result.get("body", ""))}')
 	return result
 
 
