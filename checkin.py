@@ -67,70 +67,74 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def _browser_request(page, method: str, url: str, headers: dict) -> dict:
-	"""通过 Playwright 浏览器执行 fetch 请求（绕过 WAF TLS 指纹检测）"""
-	payload = {
-		'url': url,
-		'method': method,
-		'headers': {k: str(v) for k, v in headers.items()},
-	}
-
-	result = await page.evaluate(
-		"""(args) => {
-			return fetch(args.url, {
-				method: args.method,
-				headers: args.headers,
-			}).then(async (resp) => {
-				const text = await resp.text();
-				return {ok: resp.ok, status: resp.status, body: text};
-			}).catch((e) => {
-				return {ok: false, status: 0, body: '', error: e.message};
-			});
-		}""",
-		payload,
-	)
-	return result
-
-
-async def get_user_info_via_browser(page, account_name: str, provider_config, headers: dict) -> dict:
-	"""通过 Playwright 浏览器获取用户信息"""
+async def get_user_info_via_browser(page, account_name: str, provider_config, api_user: str) -> dict:
+	"""通过 Playwright 页面导航方式获取用户信息（全页面加载，绕过WAF检测）"""
 	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 
+	# 设置自定义请求头（通过浏览器页面设置）
+	await page.set_extra_http_headers({
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Referer': provider_config.domain,
+		provider_config.api_user_key: api_user,
+	})
+
 	try:
-		result = await _browser_request(page, 'GET', user_info_url, headers)
+		# 使用页面导航方式访问API地址（非XHR，WAF更难检测）
+		response = await page.goto(user_info_url, wait_until='networkidle')
 
-		if result.get('ok'):
-			try:
-				data = json.loads(result['body'])
-			except (json.JSONDecodeError, TypeError):
-				return {'success': False, 'error': 'Failed to parse user info response'}
+		if response is None:
+			return {'success': False, 'error': 'Navigation returned no response'}
 
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
-			return {'success': False, 'error': data.get('message', 'Unknown error')}
-		else:
-			error_msg = result.get('error', '')
-			if error_msg:
-				return {'success': False, 'error': f'Browser request failed: {error_msg}'}
-			return {'success': False, 'error': f'Browser request failed: HTTP {result.get("status")}'}
+		body = await response.text()
+		if not body:
+			return {'success': False, 'error': 'Empty response from navigate'}
+
+		try:
+			data = json.loads(body)
+		except json.JSONDecodeError:
+			return {'success': False, 'error': f'Non-JSON response. Body starts with: {body[:100]}...'}
+
+		if data.get('success'):
+			user_data = data.get('data', {})
+			quota = round(user_data.get('quota', 0) / 500000, 2)
+			used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+			return {
+				'success': True,
+				'quota': quota,
+				'used_quota': used_quota,
+				'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+			}
+		return {'success': False, 'error': data.get('message', 'Unknown error')}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
 async def execute_check_in_via_browser(page, account_name: str, sign_in_url: str, headers: dict) -> bool:
-	"""通过 Playwright 浏览器执行签到"""
+	"""通过 Playwright 浏览器执行签到（使用 fetch POST）"""
 	print(f'[NETWORK] {account_name}: Executing check-in (via browser)')
 
+	payload = {
+		'url': sign_in_url,
+		'method': 'POST',
+		'headers': {k: str(v) for k, v in headers.items()},
+	}
+
 	try:
-		result = await _browser_request(page, 'POST', sign_in_url, headers)
+		result = await page.evaluate(
+			"""(args) => {
+				return fetch(args.url, {
+					method: args.method,
+					headers: args.headers,
+				}).then(async (resp) => {
+					const text = await resp.text();
+					return {ok: resp.ok, status: resp.status, body: text};
+				}).catch((e) => {
+					return {ok: false, status: 0, body: '', error: e.message};
+				});
+			}""",
+			payload,
+		)
 
 		if result.get('ok'):
 			try:
@@ -161,7 +165,7 @@ async def execute_check_in_via_browser(page, account_name: str, sign_in_url: str
 
 
 async def check_in_account_via_browser(account: AccountConfig, account_index: int, provider_config, user_cookies: dict):
-	"""通过 Playwright 浏览器执行完整签到流程（适用于WAF严格校验拦截httpx的站点）"""
+	"""通过 Playwright 浏览器执行完整签到流程（页面导航方式，完全绕过WAF）"""
 	account_name = account.get_display_name(account_index)
 	print(f'\n[PROCESSING] Starting browser-based full check-in for {account_name}')
 
@@ -182,54 +186,56 @@ async def check_in_account_via_browser(account: AccountConfig, account_index: in
 			)
 			page = await context.new_page()
 
-			# 1. 访问登录页面，获取 WAF cookies（浏览器指纹在context中保持一致）
-			login_url = f'{provider_config.domain}{provider_config.login_path}'
-			print(f'[PROCESSING] {account_name}: Initializing browser session at login page...')
-			await page.goto(login_url, wait_until='networkidle')
 			try:
-				await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-			except Exception:
-				await page.wait_for_timeout(3000)
-			print(f'[INFO] {account_name}: Browser session initialized with WAF cookies')
+				# 1. 访问登录页面，获取 WAF cookies（浏览器指纹一致）
+				login_url = f'{provider_config.domain}{provider_config.login_path}'
+				print(f'[PROCESSING] {account_name}: Initializing browser session at login page...')
+				await page.goto(login_url, wait_until='networkidle')
+				try:
+					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+				except Exception:
+					await page.wait_for_timeout(3000)
+				print(f'[INFO] {account_name}: Browser session initialized with WAF cookies')
 
-			# 2. 在浏览器中设置用户 cookies
-			domain = urllib.parse.urlparse(provider_config.domain).hostname
-			await context.add_cookies([
-				{'name': k, 'value': v, 'domain': domain, 'path': '/'}
-				for k, v in user_cookies.items()
-			])
+				# 2. 在浏览器中设置用户 cookies
+				domain = urllib.parse.urlparse(provider_config.domain).hostname
+				await context.add_cookies([
+					{'name': k, 'value': v, 'domain': domain, 'path': '/'}
+					for k, v in user_cookies.items()
+				])
 
-			# 3. 构建请求头
-			headers = {
-				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				'Accept': 'application/json, text/plain, */*',
-				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-				'Referer': provider_config.domain,
-				'Origin': provider_config.domain,
-				provider_config.api_user_key: account.api_user,
-			}
+				# 3. 获取签到前用户信息（页面导航方式）
+				user_info_before = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+				if user_info_before and user_info_before.get('success'):
+					print(user_info_before['display'])
+				elif user_info_before:
+					print(user_info_before.get('error', 'Unknown error'))
 
-			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+				# 4. 执行签到
+				if provider_config.needs_manual_check_in():
+					sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+					checkin_headers = {
+						'Connection': 'keep-alive',
+						'Content-Type': 'application/json',
+						'X-Requested-With': 'XMLHttpRequest',
+						provider_config.api_user_key: account.api_user,
+					}
+					success = await execute_check_in_via_browser(page, account_name, sign_in_url, checkin_headers)
+					# 签到后再次获取用户信息
+					user_info_after = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+					return success, user_info_before, user_info_after
+				else:
+					print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+					# 自动签到：再次导航到用户信息API触发签到
+					user_info_after = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+					return True, user_info_before, user_info_after
 
-			# 4. 获取签到前用户信息
-			user_info_before = await get_user_info_via_browser(page, account_name, provider_config, headers)
-			if user_info_before and user_info_before.get('success'):
-				print(user_info_before['display'])
-			elif user_info_before:
-				print(user_info_before.get('error', 'Unknown error'))
-
-			# 5. 执行签到
-			if provider_config.needs_manual_check_in():
-				sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
-				checkin_headers = {**headers, 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'}
-				success = await execute_check_in_via_browser(page, account_name, sign_in_url, checkin_headers)
-				# 签到后再次获取用户信息
-				user_info_after = await get_user_info_via_browser(page, account_name, provider_config, headers)
-				return success, user_info_before, user_info_after
-			else:
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-				user_info_after = await get_user_info_via_browser(page, account_name, provider_config, headers)
-				return True, user_info_before, user_info_after
+			finally:
+				# 确保在 tempfile cleanup 之前关闭浏览器上下文
+				try:
+					await context.close()
+				except Exception:
+					pass
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
