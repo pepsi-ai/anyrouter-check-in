@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
+import urllib.parse
 from datetime import datetime
 
 import httpx
@@ -63,6 +65,181 @@ def parse_cookies(cookies_data):
 				cookies_dict[key] = value
 		return cookies_dict
 	return {}
+
+
+async def _browser_api_call(page, method: str, url: str, headers: dict) -> dict:
+	"""通过浏览器执行API调用（在已获取WAF cookies的页面上）"""
+	payload = {
+		'url': url,
+		'method': method,
+		'headers': {k: str(v) for k, v in headers.items()},
+	}
+	result = await page.evaluate(
+		"""(args) => {
+			return fetch(args.url, {
+				method: args.method,
+				headers: args.headers,
+				credentials: 'include',
+			}).then(async (resp) => {
+				const text = await resp.text();
+				return {ok: resp.ok, status: resp.status, body: text};
+			}).catch((e) => {
+				return {ok: false, status: 0, body: '', error: e.message};
+			});
+		}""",
+		payload,
+	)
+	return result
+
+
+async def get_user_info_via_browser(page, account_name: str, provider_config, api_user: str) -> dict:
+	"""通过浏览器获取用户信息（需要先导航到登录页获取WAF cookies）"""
+	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+
+	headers = {
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Referer': provider_config.domain,
+		'Origin': provider_config.domain,
+		provider_config.api_user_key: api_user,
+	}
+
+	try:
+		result = await _browser_api_call(page, 'GET', user_info_url, headers)
+
+		if result.get('ok'):
+			try:
+				data = json.loads(result['body'])
+			except (json.JSONDecodeError, TypeError):
+				return {'success': False, 'error': f'Non-JSON response ({len(result.get("body", ""))}b): {result.get("body", "")[:100]}'}
+
+			if data.get('success'):
+				user_data = data.get('data', {})
+				quota = round(user_data.get('quota', 0) / 500000, 2)
+				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+				return {
+					'success': True,
+					'quota': quota,
+					'used_quota': used_quota,
+					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+				}
+			return {'success': False, 'error': data.get('message', 'Unknown error')}
+		else:
+			error_msg = result.get('error', '')
+			if error_msg:
+				return {'success': False, 'error': f'Browser API failed: {error_msg}'}
+			return {'success': False, 'error': f'Browser API failed: HTTP {result.get("status")}'}
+	except Exception as e:
+		return {'success': False, 'error': f'Exception: {str(e)[:80]}'}
+
+
+async def execute_check_in_via_browser(page, account_name: str, provider_config, api_user: str) -> bool:
+	"""通过浏览器执行签到"""
+	print(f'[NETWORK] {account_name}: Executing check-in (via browser)')
+	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+
+	headers = {
+		'Accept': 'application/json, text/plain, */*',
+		'Content-Type': 'application/json',
+		'X-Requested-With': 'XMLHttpRequest',
+		'Referer': provider_config.domain,
+		'Origin': provider_config.domain,
+		provider_config.api_user_key: api_user,
+	}
+
+	try:
+		result = await _browser_api_call(page, 'POST', sign_in_url, headers)
+
+		if result.get('ok'):
+			try:
+				response_data = json.loads(result['body'])
+				if response_data.get('ret') == 1 or response_data.get('code') == 0 or response_data.get('success'):
+					print(f'[SUCCESS] {account_name}: Check-in successful!')
+					return True
+				else:
+					error_msg = response_data.get('msg', response_data.get('message', 'Unknown error'))
+					already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
+					if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
+						print(f'[SUCCESS] {account_name}: Already checked in today')
+						return True
+					print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
+					return False
+			except json.JSONDecodeError:
+				if 'success' in result.get('body', '').lower():
+					print(f'[SUCCESS] {account_name}: Check-in successful!')
+					return True
+				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
+				return False
+		else:
+			print(f'[FAILED] {account_name}: Check-in failed - HTTP {result.get("status")}')
+			return False
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Check-in failed - {str(e)[:50]}...')
+		return False
+
+
+async def check_in_account_via_browser(account: AccountConfig, account_index: int, provider_config, user_cookies: dict):
+	"""通过浏览器完成全部签到流程（导航到登录页获取WAF cookies，然后从浏览器内调用API）"""
+	account_name = account.get_display_name(account_index)
+	print(f'\n[PROCESSING] Starting browser-based check-in for {account_name}')
+
+	async with async_playwright() as p:
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--disable-web-security',
+					'--disable-features=VizDisplayCompositor',
+					'--no-sandbox',
+				],
+			)
+			page = await context.new_page()
+
+			try:
+				# 1. 导航到登录页，获取WAF cookies
+				login_url = f'{provider_config.domain}{provider_config.login_path}'
+				print(f'[PROCESSING] {account_name}: Navigating to login page for WAF cookies...')
+				await page.goto(login_url, wait_until='networkidle')
+				try:
+					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+				except Exception:
+					await page.wait_for_timeout(3000)
+				print(f'[INFO] {account_name}: WAF cookies obtained via login page')
+
+				# 2. 设置用户session cookie
+				domain = urllib.parse.urlparse(provider_config.domain).hostname
+				await context.add_cookies([
+					{'name': k, 'value': v, 'domain': domain, 'path': '/'}
+					for k, v in user_cookies.items()
+				])
+
+				# 3. 从浏览器内获取用户信息（签到前）
+				user_info_before = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+				if user_info_before and user_info_before.get('success'):
+					print(user_info_before['display'])
+				elif user_info_before:
+					print(user_info_before.get('error', 'Unknown error'))
+
+				# 4. 执行签到
+				if provider_config.needs_manual_check_in():
+					success = await execute_check_in_via_browser(page, account_name, provider_config, account.api_user)
+					user_info_after = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+					return success, user_info_before, user_info_after
+				else:
+					print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+					user_info_after = await get_user_info_via_browser(page, account_name, provider_config, account.api_user)
+					return True, user_info_before, user_info_after
+
+			finally:
+				try:
+					await context.close()
+				except Exception:
+					pass
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
@@ -272,6 +449,10 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
 		return False, None
+
+	# 对于需要WAF cookies的供应商，使用浏览器内API调用（避免TLS指纹不匹配）
+	if provider_config.needs_waf_cookies():
+		return await check_in_account_via_browser(account, account_index, provider_config, user_cookies)
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
