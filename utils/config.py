@@ -21,6 +21,7 @@ class ProviderConfig:
 	api_user_key: str = 'new-api-user'
 	bypass_method: Literal['waf_cookies'] | None = None
 	waf_cookie_names: List[str] | None = None
+	api_via_browser: bool = False
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -88,9 +89,9 @@ class AppConfig:
 			),
 			'agentrouter': ProviderConfig(
 				name='agentrouter',
-				domain='https://agentrouter.org',
+				domain='https://anyrouter.top',
 				login_path='/login',
-				sign_in_path=None,  # 无需签到接口，查询用户信息时自动完成签到
+				sign_in_path='/api/user/sign_in',
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
 				bypass_method=None,
