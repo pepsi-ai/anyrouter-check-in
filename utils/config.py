@@ -21,7 +21,6 @@ class ProviderConfig:
 	api_user_key: str = 'new-api-user'
 	bypass_method: Literal['waf_cookies'] | None = None
 	waf_cookie_names: List[str] | None = None
-	api_via_browser: bool = False
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -56,7 +55,6 @@ class ProviderConfig:
 			api_user_key=data.get('api_user_key', 'new-api-user'),
 			bypass_method=data.get('bypass_method'),
 			waf_cookie_names=data.get('waf_cookie_names'),
-		api_via_browser=data.get('api_via_browser', False),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -97,7 +95,6 @@ class AppConfig:
 				api_user_key='new-api-user',
 				bypass_method=None,
 				waf_cookie_names=None,
-				api_via_browser=True,
 			),
 		}
 
