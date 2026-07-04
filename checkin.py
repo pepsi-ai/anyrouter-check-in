@@ -81,19 +81,22 @@ async def get_user_info_via_browser(page, account_name: str, provider_config, ap
 
 	try:
 		# 使用页面导航方式访问API地址（非XHR，WAF更难检测）
-		response = await page.goto(user_info_url, wait_until='networkidle')
+		response = await page.goto(user_info_url, wait_until='domcontentloaded')
 
 		if response is None:
 			return {'success': False, 'error': 'Navigation returned no response'}
 
+		print(f'[DEBUG] {account_name}: API response status={response.status}, url={response.url}')
 		body = await response.text()
 		if not body:
 			return {'success': False, 'error': 'Empty response from navigate'}
 
+		print(f'[DEBUG] {account_name}: Body length={len(body)}, preview={body[:200]}')
+
 		try:
 			data = json.loads(body)
 		except json.JSONDecodeError:
-			return {'success': False, 'error': f'Non-JSON response. Body starts with: {body[:100]}...'}
+			return {'success': False, 'error': f'Non-JSON response ({response.status}, {len(body)}b): {body[:150]}'}
 
 		if data.get('success'):
 			user_data = data.get('data', {})
@@ -107,7 +110,7 @@ async def get_user_info_via_browser(page, account_name: str, provider_config, ap
 			}
 		return {'success': False, 'error': data.get('message', 'Unknown error')}
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		return {'success': False, 'error': f'Exception in get_user_info_via_browser: {str(e)[:80]}'}
 
 
 async def execute_check_in_via_browser(page, account_name: str, sign_in_url: str, headers: dict) -> bool:
