@@ -71,7 +71,7 @@ async def get_user_info_via_browser(page, account_name: str, provider_config, ap
 	"""通过 Playwright 页面导航方式获取用户信息（全页面加载，绕过WAF检测）"""
 	user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 
-	# 设置自定义请求头
+	# 设置自定义请求头（通过浏览器页面设置）
 	await page.set_extra_http_headers({
 		'Accept': 'application/json, text/plain, */*',
 		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -80,33 +80,23 @@ async def get_user_info_via_browser(page, account_name: str, provider_config, ap
 	})
 
 	try:
-		# 页面导航到API地址，等待WAF JS挑战完成及最终页面加载
-		response = await page.goto(user_info_url, wait_until='networkidle')
+		# 使用页面导航方式访问API地址（非XHR，WAF更难检测）
+		response = await page.goto(user_info_url, wait_until='domcontentloaded')
 
-		# 额外等待确保WAF挑战的JS执行完毕并完成重定向
-		await page.wait_for_timeout(3000)
+		if response is None:
+			return {'success': False, 'error': 'Navigation returned no response'}
 
-		# 读取当前页面的文本内容（经过WAF挑战后的实际响应）
-		body = await page.evaluate("document.body.innerText")
-		if not body or not body.strip():
-			# 如果body为空，尝试从response.text()获取
-			if response:
-				body = await response.text()
-
+		print(f'[DEBUG] {account_name}: API response status={response.status}, url={response.url}')
+		body = await response.text()
 		if not body:
-			return {'success': False, 'error': 'Empty response'}
+			return {'success': False, 'error': 'Empty response from navigate'}
 
-		# 尝试解析JSON
+		print(f'[DEBUG] {account_name}: Body length={len(body)}, preview={body[:200]}')
+
 		try:
 			data = json.loads(body)
 		except json.JSONDecodeError:
-			# 如果还是挑战页，再试一次等待
-			await page.wait_for_timeout(5000)
-			body = await page.evaluate("document.body.innerText")
-			try:
-				data = json.loads(body)
-			except json.JSONDecodeError:
-				return {'success': False, 'error': f'Non-JSON after WAF wait ({len(body)}b): {body[:100]}'}
+			return {'success': False, 'error': f'Non-JSON response ({response.status}, {len(body)}b): {body[:150]}'}
 
 		if data.get('success'):
 			user_data = data.get('data', {})
@@ -120,7 +110,7 @@ async def get_user_info_via_browser(page, account_name: str, provider_config, ap
 			}
 		return {'success': False, 'error': data.get('message', 'Unknown error')}
 	except Exception as e:
-		return {'success': False, 'error': f'Exception in get_user_info: {str(e)[:80]}'}
+		return {'success': False, 'error': f'Exception in get_user_info_via_browser: {str(e)[:80]}'}
 
 
 async def execute_check_in_via_browser(page, account_name: str, sign_in_url: str, headers: dict) -> bool:
